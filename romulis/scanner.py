@@ -9,6 +9,7 @@ from romulis.database import schema, sql
 CUE_PATH = os.path.expanduser("~/.cache/lutris/redump/cuesheets/Sony - PlayStation/")
 DEST_PATH = "/media/strider/Backup/Games/Sega/Dreamcast_redump"
 
+
 def get_file_checksum_slow(filename, hash_type="sha1"):
     """Return the checksum hash of a given type"""
     hasher = hashlib.new(hash_type)
@@ -27,6 +28,7 @@ def get_sha1_checksum(filename):
 
 
 def extract_7z(archive_path):
+    """Extract a 7z archive"""
     return subprocess.check_output(["7z", "x", "-aoa", archive_path])
 
 
@@ -55,94 +57,118 @@ def get_directory_checksums(directory):
                     "sha1": sha1sum
                 })
 
-def get_game_by_id(cursor, game_id):
-    games = sql.db_select(cursor, "games", condition=("id", game_id))
-    for game in games:
-        return game
-
-
-def conflict_resolver(file_matches, roms_by_game):
-    # Resolve conflicts
-    conflicts = set()
-    for path in file_matches:
-        if len(file_matches[path]) == 1:
-            continue
-        game_ids = tuple(sorted({rom["game_id"] for rom in file_matches[path]}))
-        conflicts.add(game_ids)
-    conflict_resolution = {}
-    for conflict in conflicts:
-        game_ids = sorted(conflict, key=lambda gid: len(roms_by_game[gid]))
-        conflict_resolution[conflict] = game_ids[0]
-    return conflict_resolution
-
 
 def do_match():
     """Match local files with known databases"""
-    roms_by_game = defaultdict(set)
-    games_by_roms = defaultdict(set)
-    paths_by_roms = defaultdict(set)
-    game_details = {}
-    datsets = {}
-    with sql.db_cursor(schema.DB_PATH) as cursor:
-        local_files = sql.db_select(cursor, "local_files")
-        file_matches = defaultdict(list)
-        for local_file in local_files:
-            matches = sql.db_select(cursor, "roms", condition=("sha1", local_file["sha1"]))
-            for match in matches:
-                file_matches[local_file["path"]].append((match))
+    matcher = RomMatcher()
+    matcher.rename_sets()
 
+
+class RomMatcher:
+    """Match local files with rom sets stored in database"""
+    def __init__(self):
+        self.connection = sql.get_connection(schema.DB_PATH)
+        self.cursor = self.connection.cursor()
+        self.roms_by_game = defaultdict(set)
+        self.paths_by_roms = defaultdict(set)
+
+    def __del__(self):
+        self.connection.commit()
+        self.connection.close()
+
+    def rename_sets(self):
+        """Rename (and move) ROMs to their destination"""
+        romset_matches = self.get_fullset_matches()
+        _datsets, game_details = self.get_datsets_and_game_details(self.roms_by_game)
+        for game_id in romset_matches:
+            romset = romset_matches[game_id]
+            destdir = os.path.join(DEST_PATH, game_details[game_id]["name"])
+            self.rename_roms(destdir, romset)
+
+    def get_game_by_id(self, game_id):
+        """Return a game by its ID"""
+        games = sql.db_select(self.cursor, "games", condition=("id", game_id))
+        for game in games:
+            return game
+
+    def get_file_matches(self):
+        """Return file matched locally"""
+        file_matches = defaultdict(list)
+        local_files = sql.db_select(self.cursor, "local_files")
+        for local_file in local_files:
+            matches = sql.db_select(self.cursor, "roms", condition=("sha1", local_file["sha1"]))
+            for match in matches:
+                local_path = local_file["path"]
+                if os.path.exists(local_path):
+                    file_matches[local_path].append((match))
+        return file_matches
+
+    def set_path_and_rom_links(self, file_matches):
+        """Create mappings to access roms by game ID and paths by ROM ID"""
         # Link games and roms together
         for path in file_matches:
             for rom in file_matches[path]:
-                game_id = rom["game_id"]
-                roms_by_game[game_id].add(rom["id"])
-                games_by_roms[rom["id"]].add(game_id)
-                paths_by_roms[rom["id"]].add(path)
+                self.roms_by_game[rom["game_id"]].add(rom["id"])
+                self.paths_by_roms[rom["id"]].add(path)
 
-        # Populate game details and datset
+    def get_datsets_and_game_details(self, roms_by_game):
+        """Populate game details and datset"""
+        datsets = {}
+        game_details = {}
         for game_id in roms_by_game:
-            games = sql.db_select(cursor, "games", condition=("id", game_id))
+            games = sql.db_select(self.cursor, "games", condition=("id", game_id))
             for game in games:
                 game_details[game_id] = game
                 datset_id = game["datset_id"]
             if datset_id not in datsets:
-                datsets_rows = sql.db_select(cursor, "datsets", condition=("id", datset_id))
+                datsets_rows = sql.db_select(self.cursor, "datsets", condition=("id", datset_id))
                 datsets[datset_id] = datsets_rows[0]
+        return datsets, game_details
 
+    def get_romsets(self):
+        """Return romsets found during the scan.
+        The romsets are keys by game ID.
+        """
         romsets = {}
-        for game_id in roms_by_game:
-            romsets[game_id] = sql.db_select(cursor, "roms", condition=("game_id", game_id))
+        for game_id in self.roms_by_game:
+            romsets[game_id] = sql.db_select(self.cursor, "roms", condition=("game_id", game_id))
+        return romsets
 
-        romset_matches = defaultdict(list)
-        for path in sorted(file_matches.keys()):
-            for rom in file_matches[path]:
-                game_id = rom["game_id"]
-                if rom["name"] not in [rom["name"] for rom in romset_matches[game_id]]:
-                    romset_matches[game_id].append(rom)
-
+    def get_romset_matches(self, romsets):
+        """Return matches found for each romset"""
+        romset_matches = {}
         for game_id in romsets:
-            have = romset_matches[game_id]
-            have_names = [rom["name"] for rom in have]
-            need = romsets[game_id]
-            need_names = [rom["name"] for rom in need]
-            missing = [rom for rom in need if rom["name"] not in have_names]
-            cuesheets = []
+            match = {}
+            romset = romsets[game_id]
+            for rom in romsets[game_id]:
+                if rom["id"] in self.paths_by_roms:
+                    match[rom["id"]] = self.paths_by_roms[rom["id"]]
+
+            missing = [rom for rom in romset if rom["id"] not in match]
             if len(missing) == 1 and missing[0]["name"].endswith(".cue"):
                 cue_path = os.path.join(CUE_PATH, missing[0]["name"])
                 if os.path.exists(cue_path):
-                    cuesheets.append(cue_path)
-            if len(have) + len(cuesheets) == len(need):
-                print("Set complete: %s" % game_details[game_id]["name"])
+                    match[missing[0]["id"]] = cue_path
+            if len(match) == len(romset):
+                print("Full set detected: %s" % match)
+                romset_matches[game_id] = match
+        return romset_matches
 
-            destdir = os.path.join(DEST_PATH, game_details[game_id]["name"])
-            if not os.path.isdir(destdir):
-                os.makedirs(destdir)
+    @staticmethod
+    def rename_roms(destdir, romset):
+        """Move and rename ROMs to their destination"""
+        if not os.path.isdir(destdir):
+            os.makedirs(destdir)
 
-            for rom in romset_matches[game_id]:
-                srcpath = list(paths_by_roms[rom["id"]])[0]
-                destpath = os.path.join(destdir, rom["name"])
-                if os.path.exists(srcpath):
-                    os.rename(srcpath, destpath)
+        for rom in romset:
+            srcpath = romset[rom["id"]]
+            destpath = os.path.join(destdir, rom["name"])
+            if srcpath.startswith(CUE_PATH):
+                shutil.copy(srcpath, destpath)
+            else:
+                os.rename(srcpath, destpath)
 
-            for cuesheet in cuesheets:
-                shutil.copy(cuesheet, os.path.join(destdir, os.path.basename(cuesheet)))
+    def get_fullset_matches(self):
+        """Return all full romsets found"""
+        self.set_path_and_rom_links(self.get_file_matches())
+        return self.get_romset_matches(self.get_romsets())

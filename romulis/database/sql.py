@@ -1,14 +1,19 @@
+"""Database module"""
 import sqlite3
 
+def get_connection(db_path):
+    """Return a connection to a SQLite database"""
+    return sqlite3.connect(db_path)
 
-class db_cursor(object):
 
+class db_cursor:  # pylint: disable=invalid-name
+    """Context manager for maintaining a SQLite cursor"""
     def __init__(self, db_path):
         self.db_path = db_path
         self.db_conn = None
 
     def __enter__(self):
-        self.db_conn = sqlite3.connect(self.db_path)
+        self.db_conn = get_connection(self.db_path)
         cursor = self.db_conn.cursor()
         return cursor
 
